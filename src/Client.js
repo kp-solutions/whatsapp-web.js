@@ -30,9 +30,11 @@ const NoAuth = require('./authStrategies/NoAuth');
  * @param {number} options.takeoverOnConflict - If another whatsapp web session is detected (another browser), take over the session in the current browser
  * @param {number} options.takeoverTimeoutMs - How much time to wait before taking over the session
  * @param {string} options.userAgent - User agent to use in puppeteer
- * @param {string} options.ffmpegPath - Ffmpeg path to use when formatting videos to webp while sending stickers 
+ * @param {string} options.ffmpegPath - Ffmpeg path to use when formating videos to webp while sending stickers 
  * @param {boolean} options.bypassCSP - Sets bypassing of page's Content-Security-Policy.
  * @param {object} options.proxyAuthentication - Proxy Authentication object.
+ * @param {string} options.authMethod - 'qr' or 'code'
+ * @param {string} options.phoneNumber
  * 
  * @fires Client#qr
  * @fires Client#authenticated
@@ -43,8 +45,6 @@ const NoAuth = require('./authStrategies/NoAuth');
  * @fires Client#message_create
  * @fires Client#message_revoke_me
  * @fires Client#message_revoke_everyone
- * @fires Client#message_ciphertext
- * @fires Client#message_edit
  * @fires Client#media_uploaded
  * @fires Client#group_join
  * @fires Client#group_leave
@@ -54,15 +54,16 @@ const NoAuth = require('./authStrategies/NoAuth');
  * @fires Client#contact_changed
  * @fires Client#group_admin_changed
  * @fires Client#group_membership_request
+ * @fires Client#code
  */
 class Client extends EventEmitter {
     constructor(options = {}) {
         super();
 
         this.options = Util.mergeDefault(DefaultOptions, options);
-        
-        if(!this.options.authStrategy) {
-            if(Object.prototype.hasOwnProperty.call(this.options, 'session')) {
+
+        if (!this.options.authStrategy) {
+            if (Object.prototype.hasOwnProperty.call(this.options, 'session')) {
                 process.emitWarning(
                     'options.session is deprecated and will be removed in a future release due to incompatibility with multi-device. ' +
                     'Use the LocalAuth authStrategy, don\'t pass in a session as an option, or suppress this warning by using the LegacySessionAuth strategy explicitly (see https://wwebjs.dev/guide/authentication.html#legacysessionauth-strategy).',
@@ -102,20 +103,18 @@ class Client extends EventEmitter {
             page = await browser.newPage();
         } else {
             const browserArgs = [...(puppeteerOpts.args || [])];
-            if(!browserArgs.find(arg => arg.includes('--user-agent'))) {
+            if (!browserArgs.find(arg => arg.includes('--user-agent'))) {
                 browserArgs.push(`--user-agent=${this.options.userAgent}`);
             }
-            // navigator.webdriver fix
-            browserArgs.push('--disable-blink-features=AutomationControlled');
 
-            browser = await puppeteer.launch({...puppeteerOpts, args: browserArgs});
+            browser = await puppeteer.launch({ ...puppeteerOpts, args: browserArgs });
             page = (await browser.pages())[0];
         }
 
         if (this.options.proxyAuthentication !== undefined) {
             await page.authenticate(this.options.proxyAuthentication);
         }
-      
+
         await page.setUserAgent(this.options.userAgent);
         if (this.options.bypassCSP) await page.setBypassCSP(true);
 
@@ -125,18 +124,6 @@ class Client extends EventEmitter {
         await this.authStrategy.afterBrowserInitialized();
         await this.initWebVersionCache();
 
-        // ocVesion (isOfficialClient patch)
-        await page.evaluateOnNewDocument(() => {
-            const originalError = Error;
-            //eslint-disable-next-line no-global-assign
-            Error = function (message) {
-                const error = new originalError(message);
-                const originalStack = error.stack;
-                if (error.stack.includes('moduleRaid')) error.stack = originalStack + '\n    at https://web.whatsapp.com/vendors~lazy_loaded_low_priority_components.05e98054dbd60f980427.js:2:44';
-                return error;
-            };
-        });
-        
         await page.goto(WhatsWebURL, {
             waitUntil: 'load',
             timeout: 0,
@@ -212,7 +199,7 @@ class Client extends EventEmitter {
         // Scan-qrcode selector was found. Needs authentication
         if (needAuthentication) {
             const { failed, failureEventPayload, restart } = await this.authStrategy.onAuthenticationNeeded();
-            if(failed) {
+            if (failed) {
                 /**
                  * Emitted when there has been an error while trying to restore an existing session
                  * @event Client#auth_failure
@@ -227,60 +214,96 @@ class Client extends EventEmitter {
                 return;
             }
 
-            const QR_CONTAINER = 'div[data-ref]';
-            const QR_RETRY_BUTTON = 'div[data-ref] > span > button';
-            let qrRetries = 0;
-            await page.exposeFunction('qrChanged', async (qr) => {
-                /**
-                * Emitted when a QR code is received
-                * @event Client#qr
-                * @param {string} qr QR Code
-                */
-                this.emit(Events.QR_RECEIVED, qr);
-                if (this.options.qrMaxRetries > 0) {
-                    qrRetries++;
-                    if (qrRetries > this.options.qrMaxRetries) {
-                        this.emit(Events.DISCONNECTED, 'Max qrcode retries reached');
-                        await this.destroy();
+            if (this.options.authMethod == 'qr') {
+                const QR_CONTAINER = 'div[data-ref]';
+                const QR_RETRY_BUTTON = 'div[data-ref] > span > button';
+                let qrRetries = 0;
+                await page.exposeFunction('qrChanged', async (qr) => {
+                    /**
+                    * Emitted when a QR code is received
+                    * @event Client#qr
+                    * @param {string} qr QR Code
+                    */
+                    this.emit(Events.QR_RECEIVED, qr);
+                    if (this.options.qrMaxRetries > 0) {
+                        qrRetries++;
+                        if (qrRetries > this.options.qrMaxRetries) {
+                            this.emit(Events.DISCONNECTED, 'Max qrcode retries reached');
+                            await this.destroy();
+                        }
                     }
-                }
-            });
+                });
 
-            await page.evaluate(function (selectors) {
-                const qr_container = document.querySelector(selectors.QR_CONTAINER);
-                window.qrChanged(qr_container.dataset.ref);
+                await page.evaluate(function (selectors) {
+                    const qr_container = document.querySelector(selectors.QR_CONTAINER);
+                    window.qrChanged(qr_container.dataset.ref);
 
-                const obs = new MutationObserver((muts) => {
-                    muts.forEach(mut => {
-                        // Listens to qr token change
-                        if (mut.type === 'attributes' && mut.attributeName === 'data-ref') {
-                            window.qrChanged(mut.target.dataset.ref);
-                        }
-                        // Listens to retry button, when found, click it
-                        else if (mut.type === 'childList') {
-                            const retry_button = document.querySelector(selectors.QR_RETRY_BUTTON);
-                            if (retry_button) retry_button.click();
-                        }
+                    const obs = new MutationObserver((muts) => {
+                        muts.forEach(mut => {
+                            // Listens to qr token change
+                            if (mut.type === 'attributes' && mut.attributeName === 'data-ref') {
+                                window.qrChanged(mut.target.dataset.ref);
+                            }
+                            // Listens to retry button, when found, click it
+                            else if (mut.type === 'childList') {
+                                const retry_button = document.querySelector(selectors.QR_RETRY_BUTTON);
+                                if (retry_button) retry_button.click();
+                            }
+                        });
                     });
+                    obs.observe(qr_container.parentElement, {
+                        subtree: true,
+                        childList: true,
+                        attributes: true,
+                        attributeFilter: ['data-ref'],
+                    });
+                }, {
+                    QR_CONTAINER,
+                    QR_RETRY_BUTTON
                 });
-                obs.observe(qr_container.parentElement, {
-                    subtree: true,
-                    childList: true,
-                    attributes: true,
-                    attributeFilter: ['data-ref'],
+            }
+            if (this.options.authMethod == 'code') {
+                const CODE_TRY_BUTTON = 'span[role=\'button\']';
+                const PHONE_INPUT = 'input';
+                const CODE_CONTAINER = 'div[aria-details=\'link-device-phone-number-code-screen-instructions\']';
+
+                await page.exposeFunction('codeChanged', async (code) => {
+                    /**
+                    * Emitted when a Code is received
+                    * @event Client#code
+                    * @param {string} code Code
+                    */
+                    this.emit(Events.CODE_RECEIVED, code);
                 });
-            }, {
-                QR_CONTAINER,
-                QR_RETRY_BUTTON
-            });
+
+                await page.click(CODE_TRY_BUTTON);
+                await page.waitForSelector(PHONE_INPUT);
+                await page.focus(PHONE_INPUT);
+                await page.type(PHONE_INPUT, this.options.phoneNumber);
+                await page.keyboard.press('Tab');
+                await page.keyboard.press('Enter');
+
+                await page.waitForSelector(CODE_CONTAINER);
+
+                await page.evaluate(function (selectors) {
+                    const code_container = document.querySelector(selectors.CODE_CONTAINER);
+
+                    let code = '';
+                    code_container.querySelectorAll('div>span').forEach(el => code += el.innerText);
+
+                    window.codeChanged(code);
+                }, {
+                    CODE_CONTAINER
+                });
+            }
 
             // Wait for code scan
             try {
                 await page.waitForSelector(INTRO_IMG_SELECTOR, { timeout: 0 });
-            } catch(error) {
+            } catch (error) {
                 if (
-                    error.name === 'ProtocolError' && 
-                    error.message && 
+                    error.name === 'ProtocolError' &&
+                    error.message &&
                     error.message.match(/Target closed/)
                 ) {
                     // something has called .destroy() while waiting
@@ -527,9 +550,9 @@ class Client extends EventEmitter {
 
         });
 
-        await page.exposeFunction('onChatUnreadCountEvent', async (data) =>{
+        await page.exposeFunction('onChatUnreadCountEvent', async (data) => {
             const chat = await this.getChatById(data.id);
-            
+
             /**
              * Emitted when the chat unread count changes
              */
@@ -646,10 +669,10 @@ class Client extends EventEmitter {
              */
             this.emit(Events.CHAT_REMOVED, _chat);
         });
-        
+
         await page.exposeFunction('onArchiveChatEvent', async (chat, currState, prevState) => {
             const _chat = await this.getChatById(chat.id);
-            
+
             /**
              * Emitted when a chat is archived/unarchived
              * @event Client#chat_archived
@@ -661,8 +684,8 @@ class Client extends EventEmitter {
         });
 
         await page.exposeFunction('onEditMessageEvent', (msg, newBody, prevBody) => {
-            
-            if(msg.type === 'revoked'){
+
+            if (msg.type === 'revoked') {
                 return;
             }
             /**
@@ -674,16 +697,6 @@ class Client extends EventEmitter {
              */
             this.emit(Events.MESSAGE_EDIT, new Message(this, msg), newBody, prevBody);
         });
-        
-        await page.exposeFunction('onAddMessageCiphertextEvent', msg => {
-            
-            /**
-             * Emitted when messages are edited
-             * @event Client#message_ciphertext
-             * @param {Message} message
-             */
-            this.emit(Events.MESSAGE_CIPHERTEXT, new Message(this, msg));
-        });
 
         await page.evaluate(() => {
             window.Store.Msg.on('change', (msg) => { window.onChangeMessageEvent(window.WWebJS.getMessageModel(msg)); });
@@ -691,24 +704,23 @@ class Client extends EventEmitter {
             window.Store.Msg.on('change:ack', (msg, ack) => { window.onMessageAckEvent(window.WWebJS.getMessageModel(msg), ack); });
             window.Store.Msg.on('change:isUnsentMedia', (msg, unsent) => { if (msg.id.fromMe && !unsent) window.onMessageMediaUploadedEvent(window.WWebJS.getMessageModel(msg)); });
             window.Store.Msg.on('remove', (msg) => { if (msg.isNewMsg) window.onRemoveMessageEvent(window.WWebJS.getMessageModel(msg)); });
-            window.Store.Msg.on('change:body change:caption', (msg, newBody, prevBody) => { window.onEditMessageEvent(window.WWebJS.getMessageModel(msg), newBody, prevBody); });
+            window.Store.Msg.on('change:body', (msg, newBody, prevBody) => { window.onEditMessageEvent(window.WWebJS.getMessageModel(msg), newBody, prevBody); });
             window.Store.AppState.on('change:state', (_AppState, state) => { window.onAppStateChangedEvent(state); });
             window.Store.Conn.on('change:battery', (state) => { window.onBatteryStateChangedEvent(state); });
             window.Store.Call.on('add', (call) => { window.onIncomingCall(call); });
             window.Store.Chat.on('remove', async (chat) => { window.onRemoveChatEvent(await window.WWebJS.getChatModel(chat)); });
             window.Store.Chat.on('change:archive', async (chat, currState, prevState) => { window.onArchiveChatEvent(await window.WWebJS.getChatModel(chat), currState, prevState); });
-            window.Store.Msg.on('add', (msg) => { 
+            window.Store.Msg.on('add', (msg) => {
                 if (msg.isNewMsg) {
-                    if(msg.type === 'ciphertext') {
+                    if (msg.type === 'ciphertext') {
                         // defer message event until ciphertext is resolved (type changed)
                         msg.once('change:type', (_msg) => window.onAddMessageEvent(window.WWebJS.getMessageModel(_msg)));
-                        window.onAddMessageCiphertextEvent(window.WWebJS.getMessageModel(msg));
                     } else {
-                        window.onAddMessageEvent(window.WWebJS.getMessageModel(msg)); 
+                        window.onAddMessageEvent(window.WWebJS.getMessageModel(msg));
                     }
                 }
             });
-            window.Store.Chat.on('change:unreadCount', (chat) => {window.onChatUnreadCountEvent(chat);});
+            window.Store.Chat.on('change:unreadCount', (chat) => { window.onChatUnreadCountEvent(chat); });
 
             {
                 const module = window.Store.createOrUpdateReactionsModule;
@@ -719,7 +731,7 @@ class Client extends EventEmitter {
                         const parentMsgKey = window.Store.MsgKey.fromString(reaction.parentMsgKey);
                         const timestamp = reaction.timestamp / 1000;
 
-                        return {...reaction, msgKey, parentMsgKey, timestamp };
+                        return { ...reaction, msgKey, parentMsgKey, timestamp };
                     }));
 
                     return ogMethod(...args);
@@ -737,7 +749,7 @@ class Client extends EventEmitter {
         // Disconnect when navigating away when in PAIRING state (detect logout)
         this.pupPage.on('framenavigated', async () => {
             const appState = await this.getState();
-            if(!appState || appState === WAState.PAIRING) {
+            if (!appState || appState === WAState.PAIRING) {
                 await this.authStrategy.disconnect();
                 this.emit(Events.DISCONNECTED, 'NAVIGATION');
                 await this.destroy();
@@ -752,22 +764,22 @@ class Client extends EventEmitter {
         const requestedVersion = this.options.webVersion;
         const versionContent = await webCache.resolve(requestedVersion);
 
-        if(versionContent) {
+        if (versionContent) {
             await this.pupPage.setRequestInterception(true);
             this.pupPage.on('request', async (req) => {
-                if(req.url() === WhatsWebURL) {
+                if (req.url() === WhatsWebURL) {
                     req.respond({
                         status: 200,
                         contentType: 'text/html',
                         body: versionContent
-                    }); 
+                    });
                 } else {
                     req.continue();
                 }
             });
         } else {
             this.pupPage.on('response', async (res) => {
-                if(res.ok() && res.url() === WhatsWebURL) {
+                if (res.ok() && res.url() === WhatsWebURL) {
                     await webCache.persist(await res.text());
                 }
             });
@@ -790,13 +802,13 @@ class Client extends EventEmitter {
             return window.Store.AppState.logout();
         });
         await this.pupBrowser.close();
-        
+
         let maxDelay = 0;
         while (this.pupBrowser.isConnected() && (maxDelay < 10)) { // waits a maximum of 1 second before calling the AuthStrategy
             await new Promise(resolve => setTimeout(resolve, 100));
-            maxDelay++; 
+            maxDelay++;
         }
-        
+
         await this.authStrategy.logout();
     }
 
@@ -825,13 +837,6 @@ class Client extends EventEmitter {
     }
 
     /**
-     * An object representing mentions of groups
-     * @typedef {Object} GroupMention
-     * @property {string} subject - The name of a group to mention (can be custom)
-     * @property {string} id - The group ID, e.g.: 'XXXXXXXXXX@g.us'
-     */
-
-    /**
      * Message options.
      * @typedef {Object} MessageSendOptions
      * @property {boolean} [linkPreview=true] - Show links preview. Has no effect on multi-device accounts.
@@ -843,15 +848,14 @@ class Client extends EventEmitter {
      * @property {boolean} [parseVCards=true] - Automatically parse vCards and send them as contacts
      * @property {string} [caption] - Image or video caption
      * @property {string} [quotedMessageId] - Id of the message that is being quoted (or replied to)
-     * @property {GroupMention[]} [groupMentions] - An array of object that handle group mentions
-     * @property {string[]} [mentions] - User IDs to mention in the message
+     * @property {Contact[]} [mentions] - Contacts that are being mentioned in the message
      * @property {boolean} [sendSeen=true] - Mark the conversation as seen after sending the message
      * @property {string} [stickerAuthor=undefined] - Sets the author of the sticker, (if sendMediaAsSticker is true).
      * @property {string} [stickerName=undefined] - Sets the name of the sticker, (if sendMediaAsSticker is true).
      * @property {string[]} [stickerCategories=undefined] - Sets the categories of the sticker, (if sendMediaAsSticker is true). Provide emoji char array, can be null.
      * @property {MessageMedia} [media] - Media to be sent
      */
-    
+
     /**
      * Send a message to a specific chatId
      * @param {string} chatId
@@ -861,16 +865,10 @@ class Client extends EventEmitter {
      * @returns {Promise<Message>} Message that was just sent
      */
     async sendMessage(chatId, content, options = {}) {
-        if (options.mentions) {
-            !Array.isArray(options.mentions) && (options.mentions = [options.mentions]);
-            if (options.mentions.some((possiblyContact) => possiblyContact instanceof Contact)) {
-                console.warn('Mentions with an array of Contact are now deprecated. See more at https://github.com/pedroslopez/whatsapp-web.js/pull/2166.');
-                options.mentions = options.mentions.map((a) => a.id._serialized);
-            }
+        if (options.mentions && options.mentions.some(possiblyContact => possiblyContact instanceof Contact)) {
+            console.warn('Mentions with an array of Contact are now deprecated. See more at https://github.com/pedroslopez/whatsapp-web.js/pull/2166.');
+            options.mentions = options.mentions.map(a => a.id._serialized);
         }
-
-        options.groupMentions && !Array.isArray(options.groupMentions) && (options.groupMentions = [options.groupMentions]);
-
         let internalOptions = {
             linkPreview: options.linkPreview === false ? undefined : true,
             sendAudioAsVoice: options.sendAudioAsVoice,
@@ -880,8 +878,7 @@ class Client extends EventEmitter {
             caption: options.caption,
             quotedMessageId: options.quotedMessageId,
             parseVCards: options.parseVCards === false ? false : true,
-            mentionedJidList: options.mentions || [],
-            groupMentions: options.groupMentions,
+            mentionedJidList: Array.isArray(options.mentions) ? options.mentions : [],
             extraOptions: options.extra
         };
 
@@ -890,12 +887,12 @@ class Client extends EventEmitter {
         if (content instanceof MessageMedia) {
             internalOptions.attachment = content;
             internalOptions.isViewOnce = options.isViewOnce,
-            content = '';
+                content = '';
         } else if (options.media instanceof MessageMedia) {
             internalOptions.attachment = options.media;
             internalOptions.caption = content;
             internalOptions.isViewOnce = options.isViewOnce,
-            content = '';
+                content = '';
         } else if (content instanceof Location) {
             internalOptions.location = content;
             content = '';
@@ -920,10 +917,10 @@ class Client extends EventEmitter {
         if (internalOptions.sendMediaAsSticker && internalOptions.attachment) {
             internalOptions.attachment = await Util.formatToWebpSticker(
                 internalOptions.attachment, {
-                    name: options.stickerName,
-                    author: options.stickerAuthor,
-                    categories: options.stickerCategories
-                }, this.pupPage
+                name: options.stickerName,
+                author: options.stickerAuthor,
+                categories: options.stickerCategories
+            }, this.pupPage
             );
         }
 
@@ -933,16 +930,16 @@ class Client extends EventEmitter {
 
 
             if (sendSeen) {
-                await window.WWebJS.sendSeen(chatId);
+                window.WWebJS.sendSeen(chatId);
             }
 
             const msg = await window.WWebJS.sendMessage(chat, message, options, sendSeen);
-            return window.WWebJS.getMessageModel(msg);
+            return msg.serialize();
         }, chatId, content, internalOptions, sendSeen);
 
         return new Message(this, newMessage);
     }
-    
+
     /**
      * Searches for messages
      * @param {string} query
@@ -1010,22 +1007,22 @@ class Client extends EventEmitter {
 
         return ContactFactory.create(this, contact);
     }
-    
+
     async getMessageById(messageId) {
         const msg = await this.pupPage.evaluate(async messageId => {
             let msg = window.Store.Msg.get(messageId);
-            if(msg) return window.WWebJS.getMessageModel(msg);
+            if (msg) return window.WWebJS.getMessageModel(msg);
 
             const params = messageId.split('_');
-            if(params.length !== 3) throw new Error('Invalid serialized message id specified');
+            if (params.length !== 3) throw new Error('Invalid serialized message id specified');
 
             let messagesObject = await window.Store.Msg.getMessagesById([messageId]);
             if (messagesObject && messagesObject.messages.length) msg = messagesObject.messages[0];
-            
-            if(msg) return window.WWebJS.getMessageModel(msg);
+
+            if (msg) return window.WWebJS.getMessageModel(msg);
         }, messageId);
 
-        if(msg) return new Message(this, msg);
+        if (msg) return new Message(this, msg);
         return null;
     }
 
@@ -1086,11 +1083,11 @@ class Client extends EventEmitter {
      */
     async setDisplayName(displayName) {
         const couldSet = await this.pupPage.evaluate(async displayName => {
-            if(!window.Store.Conn.canSetMyPushname()) return false;
+            if (!window.Store.Conn.canSetMyPushname()) return false;
 
-            if(window.Store.MDBackend) {
-                await window.Store.Settings.setPushname(displayName);
-                return true;
+            if (window.Store.MDBackend) {
+                // TODO
+                return false;
             } else {
                 const res = await window.Store.Wap.setPushname(displayName);
                 return !res.status || res.status === 200;
@@ -1099,14 +1096,14 @@ class Client extends EventEmitter {
 
         return couldSet;
     }
-    
+
     /**
      * Gets the current connection state for the client
      * @returns {WAState} 
      */
     async getState() {
         return await this.pupPage.evaluate(() => {
-            if(!window.Store) return null;
+            if (!window.Store) return null;
             return window.Store.AppState.state;
         });
     }
@@ -1200,7 +1197,7 @@ class Client extends EventEmitter {
         unmuteDate = unmuteDate ? unmuteDate.getTime() / 1000 : -1;
         await this.pupPage.evaluate(async (chatId, timestamp) => {
             let chat = await window.Store.Chat.get(chatId);
-            await chat.mute.mute({expiration: timestamp, sendDevice:!0});
+            await chat.mute.mute({ expiration: timestamp, sendDevice: !0 });
         }, chatId, unmuteDate || -1);
     }
 
@@ -1237,11 +1234,11 @@ class Client extends EventEmitter {
                 const chatWid = window.Store.WidFactory.createWid(contactId);
                 return await window.Store.ProfilePic.profilePicFind(chatWid);
             } catch (err) {
-                if(err.name === 'ServerStatusCodeError') return undefined;
+                if (err.name === 'ServerStatusCodeError') return undefined;
                 throw err;
             }
         }, contactId);
-        
+
         return profilePic ? profilePic.eurl : undefined;
     }
 
@@ -1255,8 +1252,8 @@ class Client extends EventEmitter {
             let contact = window.Store.Contact.get(contactId);
             if (!contact) {
                 const wid = window.Store.WidFactory.createUserWid(contactId);
-                const chatConstructor = window.Store.Contact.getModelsArray().find(c=>!c.isGroup).constructor;
-                contact = new chatConstructor({id: wid});
+                const chatConstructor = window.Store.Contact.getModelsArray().find(c => !c.isGroup).constructor;
+                contact = new chatConstructor({ id: wid });
             }
 
             if (contact.commonGroups) {
@@ -1547,7 +1544,7 @@ class Client extends EventEmitter {
 
         return success;
     }
-    
+
     /**
      * Change labels in chats
      * @param {Array<number|string>} labelIds
@@ -1563,12 +1560,12 @@ class Client extends EventEmitter {
             const labels = window.WWebJS.getLabels().filter(e => labelIds.find(l => l == e.id) !== undefined);
             const chats = window.Store.Chat.filter(e => chatIds.includes(e.id._serialized));
 
-            let actions = labels.map(label => ({id: label.id, type: 'add'}));
+            let actions = labels.map(label => ({ id: label.id, type: 'add' }));
 
             chats.forEach(chat => {
                 (chat.labels || []).forEach(n => {
                     if (!actions.find(e => e.id == n)) {
-                        actions.push({id: n, type: 'remove'});
+                        actions.push({ id: n, type: 'remove' });
                     }
                 });
             });
@@ -1638,67 +1635,6 @@ class Client extends EventEmitter {
             const { requesterIds = null, sleep = [250, 500] } = options;
             return await window.WWebJS.membershipRequestAction(groupId, 'Reject', requesterIds, sleep);
         }, groupId, options);
-    }
-
-
-    /**
-     * Setting  autoload download audio
-     * @param {boolean} flag true/false
-     */
-    async setAutoDownloadAudio(flag) {
-        await this.pupPage.evaluate(async flag => {
-            const autoDownload = window.Store.Settings.getAutoDownloadAudio();
-            if (autoDownload === flag) {
-                return flag;
-            }
-            await window.Store.Settings.setAutoDownloadAudio(flag);
-            return flag;
-        }, flag);
-    }
-
-    /**
-     * Setting  autoload download documents
-     * @param {boolean} flag true/false
-     */
-    async setAutoDownloadDocuments(flag) {
-        await this.pupPage.evaluate(async flag => {
-            const autoDownload = window.Store.Settings.getAutoDownloadDocuments();
-            if (autoDownload === flag) {
-                return flag;
-            }
-            await window.Store.Settings.setAutoDownloadDocuments(flag);
-            return flag;
-        }, flag);
-    }
-
-    /**
-     * Setting  autoload download photos
-     * @param {boolean} flag true/false
-     */
-    async setAutoDownloadPhotos(flag) {
-        await this.pupPage.evaluate(async flag => {
-            const autoDownload = window.Store.Settings.getAutoDownloadPhotos();
-            if (autoDownload === flag) {
-                return flag;
-            }
-            await window.Store.Settings.setAutoDownloadPhotos(flag);
-            return flag;
-        }, flag);
-    }
-
-    /**
-     * Setting  autoload download videos
-     * @param {boolean} flag true/false
-     */
-    async setAutoDownloadVideos(flag) {
-        await this.pupPage.evaluate(async flag => {
-            const autoDownload = window.Store.Settings.getAutoDownloadVideos();
-            if (autoDownload === flag) {
-                return flag;
-            }
-            await window.Store.Settings.setAutoDownloadVideos(flag);
-            return flag;
-        }, flag);
     }
 }
 

@@ -18,7 +18,9 @@ exports.DefaultOptions = {
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.67 Safari/537.36',
     ffmpegPath: 'ffmpeg',
     bypassCSP: false,
-    proxyAuthentication: undefined
+    proxyAuthentication: undefined,
+    authMethod: 'qr',
+    phoneNumber: ''
 };
 
 /**
@@ -44,7 +46,6 @@ exports.Events = {
     CHAT_REMOVED: 'chat_removed',
     CHAT_ARCHIVED: 'chat_archived',
     MESSAGE_RECEIVED: 'message',
-    MESSAGE_CIPHERTEXT: 'message_ciphertext',
     MESSAGE_CREATE: 'message_create',
     MESSAGE_REVOKED_EVERYONE: 'message_revoke_everyone',
     MESSAGE_REVOKED_ME: 'message_revoke_me',
@@ -65,7 +66,9 @@ exports.Events = {
     STATE_CHANGED: 'change_state',
     BATTERY_CHANGED: 'change_battery',
     INCOMING_CALL: 'call',
-    REMOTE_SESSION_SAVED: 'remote_session_saved'
+    REMOTE_SESSION_SAVED: 'remote_session_saved',
+    CODE_RECEIVED: 'code',
+
 };
 
 /**
