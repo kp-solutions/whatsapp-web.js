@@ -68,7 +68,7 @@ exports.Events = {
     INCOMING_CALL: 'call',
     REMOTE_SESSION_SAVED: 'remote_session_saved',
     CODE_RECEIVED: 'code',
-
+    VOTE_UPDATE: 'vote_update'
 };
 
 /**
